@@ -26,14 +26,14 @@ func main() {
 	p := pubsub.NewPublisher(100*time.Millisecond, 10)
 	defer p.Close()
 
-	protobuf := p.SubscribeSubject(func(subject any) bool {
+	protobuf, _ := p.SubscribeSubject(func(subject any) bool {
 		s, ok := subject.(string)
 		if !ok {
 			return false
 		}
 		return strings.Contains(s, "protobuf")
 	})
-	grpc := p.SubscribeSubject(func(subject any) bool {
+	grpc, _ := p.SubscribeSubject(func(subject any) bool {
 		s, ok := subject.(string)
 		if !ok {
 			return false
