@@ -31,40 +31,46 @@ func NewPublisher(timeout time.Duration, buffer int) *Publisher {
 }
 
 // Subscribe adds a new subscriber to the publisher returning the channel.
-func (p *Publisher) Subscribe() chan any {
+func (p *Publisher) Subscribe() (chan any, error) {
 	return p.SubscribeSubjectWithBuffer(nil, p.buffer)
 }
 
 // SubscribeSubject adds a new subscriber that a subject will filter by function f.
-func (p *Publisher) SubscribeSubject(f func(any) bool) chan any {
+func (p *Publisher) SubscribeSubject(f func(any) bool) (chan any, error) {
 	return p.SubscribeSubjectWithBuffer(f, p.buffer)
 }
 
 // SubscribeSubjectWithBuffer adds a new subscriber that a subject will filter by function f.
 // The returned channel has a buffer of the specified size.
-func (p *Publisher) SubscribeSubjectWithBuffer(f func(any) bool, buffer int) chan any {
-	c := make(chan any, buffer)
+func (p *Publisher) SubscribeSubjectWithBuffer(f func(any) bool, buffer int) (chan any, error) {
 	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil, ErrClosedPublisher
+	}
+
+	c := make(chan any, buffer)
 	p.subscribers[c] = f
 	p.mu.Unlock()
-	return c
+	return c, nil
 }
 
 // Unsubscribe removes the specified subscriber from the publisher.
-// Unsubscribe does not close the channel, to prevent a read from the channel succeeding incorrectly.
+// Unsubscribe does close the channel.
 func (p *Publisher) Unsubscribe(c chan any) {
 	p.mu.Lock()
-	if _, ok := p.subscribers[c]; !ok {
-		p.mu.Unlock()
-		return
+	if _, ok := p.subscribers[c]; ok {
+		delete(p.subscribers, c)
+		close(c)
 	}
-	delete(p.subscribers, c)
 	p.mu.Unlock()
 }
 
 var timerPool = sync.Pool{
 	New: func() any {
-		return time.NewTimer(1<<63 - 1)
+		t := time.NewTimer(1<<63 - 1)
+		t.Stop()
+		return t
 	},
 }
 
@@ -74,7 +80,6 @@ func (p *Publisher) deliverSubject(c chan any, subject any, wg *sync.WaitGroup) 
 	if p.timeout > 0 {
 		t := timerPool.Get().(*time.Timer)
 		defer timerPool.Put(t)
-		t.Stop()
 		t.Reset(p.timeout)
 		// No defer, as we don't know which
 		// case will be selected
@@ -106,30 +111,39 @@ type subscriber struct {
 	f func(any) bool
 }
 
+var wgPool = sync.Pool{
+	New: func() any {
+		return new(sync.WaitGroup)
+	},
+}
+
 // Publish deliver the subject to all subscribers currently registered with the publisher.
-func (p *Publisher) Publish(subject any) {
+func (p *Publisher) Publish(subject any) error {
 	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return ErrClosedPublisher
+	}
+
 	if len(p.subscribers) == 0 {
 		p.mu.Unlock()
-		return
+		return nil
 	}
 
-	subscribers := make([]subscriber, 0, len(p.subscribers))
-	for sub, f := range p.subscribers {
-		subscribers = append(subscribers, subscriber{sub, f})
-	}
-	p.mu.Unlock()
-
-	var wg sync.WaitGroup
-	for _, sub := range subscribers {
-		if sub.f != nil && !sub.f(subject) {
+	wg := wgPool.Get().(*sync.WaitGroup)
+	defer wgPool.Put(wg)
+	for c, f := range p.subscribers {
+		if f != nil && !f(subject) {
 			continue
 		}
 
 		wg.Add(1)
-		go p.deliverSubject(sub.c, subject, &wg)
+		go p.deliverSubject(c, subject, wg)
 	}
 	wg.Wait()
+
+	p.mu.Unlock()
+	return nil
 }
 
 // Len returns the number of subscribers currently registered with the publisher.
@@ -139,6 +153,13 @@ func (p *Publisher) Len() int {
 	p.mu.Unlock()
 	return n
 }
+
+// ErrClosedPublisher is the error used for publish or subscribe operations on a closed publisher.
+var ErrClosedPublisher = closedPublisherErr{}
+
+type closedPublisherErr struct{}
+
+func (closedPublisherErr) Error() string { return "publisher is already closed" }
 
 // Close closes the channels to all subscribers registered with the publisher.
 func (p *Publisher) Close() {

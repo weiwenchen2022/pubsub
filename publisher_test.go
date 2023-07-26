@@ -6,19 +6,23 @@ import (
 	"time"
 )
 
-func TestSendToOneSub(t *testing.T) {
+func TestPublishSingle(t *testing.T) {
 	t.Parallel()
 
 	p := NewPublisher(100*time.Millisecond, 10)
-	c := p.Subscribe()
+	c, _ := p.Subscribe()
 
-	p.Publish("hello")
-	if got := <-c; got != "hello" {
-		t.Errorf(`got %#v, want "hello"`, got)
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		p.Publish("hello")
+	}()
+
+	if msg := <-c; msg != "hello" {
+		t.Errorf(`got %#v, want "hello"`, msg)
 	}
 }
 
-func TestSendToMultipleSubs(t *testing.T) {
+func TestPublishMultiple(t *testing.T) {
 	t.Parallel()
 
 	p := NewPublisher(100*time.Millisecond, 10)
@@ -26,35 +30,43 @@ func TestSendToMultipleSubs(t *testing.T) {
 	const n = 5
 	subs := make([]chan any, 0, n)
 	for i := 0; i < n; i++ {
-		subs = append(subs, p.Subscribe())
+		sub, _ := p.Subscribe()
+		subs = append(subs, sub)
 	}
 
-	p.Publish("hello")
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		p.Publish("hello")
+	}()
 
 	for _, c := range subs {
-		if got := <-c; got != "hello" {
-			t.Errorf(`got %#v, want "hello"`, got)
+		if msg := <-c; msg != "hello" {
+			t.Errorf(`got %#v, want "hello"`, msg)
 		}
 	}
 }
 
-func TestEvictOneSub(t *testing.T) {
+func TestUnsubscribe(t *testing.T) {
 	t.Parallel()
 
 	p := NewPublisher(100*time.Millisecond, 10)
-	c1, c2 := p.Subscribe(), p.Subscribe()
+	c1, _ := p.Subscribe()
+	c2, _ := p.Subscribe()
 
 	p.Unsubscribe(c1)
 	p.Publish("hello")
 
+	valid := true
 	select {
-	case <-c1:
-		t.Error("expected c1 to not receive the published message")
+	case _, valid = <-c1:
 	default:
 	}
+	if valid {
+		t.Error("expected c1 to be closed")
+	}
 
-	if got := <-c2; got != "hello" {
-		t.Errorf(`got %#v, want "hello"`, got)
+	if msg := <-c2; msg != "hello" {
+		t.Errorf(`got %#v, want "hello"`, msg)
 	}
 }
 
@@ -65,18 +77,21 @@ func TestClosePublisher(t *testing.T) {
 	const n = 5
 	subs := make([]chan any, 0, 5)
 	for i := 0; i < n; i++ {
-		subs = append(subs, p.Subscribe())
+		sub, _ := p.Subscribe()
+		subs = append(subs, sub)
 	}
 
-	p.Close()
+	closed := make(chan struct{})
+	go func() { p.Close(); close(closed) }()
+	<-closed
 
 	for _, c := range subs {
-		opened := true
+		valid := true
 		select {
-		case _, opened = <-c:
+		case _, valid = <-c:
 		default:
 		}
-		if opened {
+		if valid {
 			t.Error("expected all subscriber channels to be closed")
 		}
 	}
@@ -92,28 +107,20 @@ type testSubscriber struct {
 func (s *testSubscriber) Err() error { return <-s.errorc }
 
 func newTestSubscriber(p *Publisher) *testSubscriber {
+	c, _ := p.Subscribe()
 	ts := &testSubscriber{
-		datac:  p.Subscribe(),
+		datac:  c,
 		errorc: make(chan error, 1),
 	}
 
 	go func() {
-		defer close(ts.errorc)
-		for {
-			select {
-			case data, ok := <-ts.datac:
-				if !ok {
-					return
-				}
-
-				if sampleText != data {
-					ts.errorc <- fmt.Errorf("Unexpected data %T (%#[1]v)", data)
-					return
-				}
-			case <-time.After(100 * time.Millisecond):
+		for data := range ts.datac {
+			if sampleText != data {
+				ts.errorc <- fmt.Errorf("Unexpected data %T (%#[1]v)", data)
 				return
 			}
 		}
+		ts.errorc <- nil
 	}()
 
 	return ts
@@ -130,9 +137,12 @@ func TestPubSubRace(t *testing.T) {
 	for i := 0; i < n; i++ {
 		subs = append(subs, newTestSubscriber(p))
 	}
-	for i := 0; i < 1000; i++ {
-		p.Publish(sampleText)
-	}
+
+	go func() {
+		for i := 0; i < 1000; i++ {
+			_ = p.Publish(sampleText)
+		}
+	}()
 
 	go func() {
 		time.Sleep(1 * time.Second)
